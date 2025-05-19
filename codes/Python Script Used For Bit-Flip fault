@@ -1,0 +1,44 @@
+doc.add_paragraph(f'Registers tested: {", ".join(registers_to_test)}')
+doc.add_paragraph(f'Bit flipped: {bit_to_flip}')
+doc.add_paragraph(f'Iterations: {iterations}')
+doc.add_paragraph('')
+
+for i in range(iterations):
+    doc.add_heading(f'Iteration {i+1}', level=1)
+
+    # Interrupt CPU to safely read/write registers
+    gdbmi.write('interrupt')
+    time.sleep(0.5)
+
+    for reg in registers_to_test:
+        resp = gdbmi.write(f'-data-evaluate-expression ${reg}')
+
+        current_val = None
+        for r in resp:
+            if r['type'] == 'result' and 'payload' in r:
+                val_str = r['payload'].get('value')
+                if val_str:
+                    try:
+                        current_val = int(val_str, 16)
+                    except ValueError:
+                        current_val = None
+                    break
+
+        if current_val is None:
+            doc.add_paragraph(f'[-] Could not read register {reg}')
+            continue
+
+        flipped_val = current_val ^ (1 << bit_to_flip)
+        gdbmi.write(f'set ${reg} = {flipped_val}')
+
+        doc.add_paragraph(
+            f'Register {reg}: initial=0x{current_val:x}, flipped bit {bit_to_flip} → 0x{flipped_val:x>        )
+
+    doc.add_paragraph('')
+    time.sleep(delay_seconds)
+
+report_path = '/mnt/f/loggins/bit_flip_fault_report.docx'
+doc.save(report_path)
+
+print(f'[+] Completed {iterations} iterations. Report saved at {report_path}')
+gdbmi.exit()
