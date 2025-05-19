@@ -1,0 +1,78 @@
+from pygdbmi.gdbcontroller import GdbController
+from docx import Document
+from datetime import datetime
+import time
+
+instruction_address = 0x80000000
+iterations = 50
+bit_to_flip = 3
+delay_seconds = 2
+
+# Start GDB
+gdbmi = GdbController(command=["gdb-multiarch", "--nx", "--interpreter=mi3"])
+gdbmi.write("-target-select remote localhost:1234")
+time.sleep(1)
+
+# Prepare report
+doc = Document()
+doc.add_heading("Instruction Corruption Fault Injection Report", 0)
+doc.add_paragraph(f"Test started: {datetime.now()}")
+doc.add_paragraph(f"Instruction address: 0x{instruction_address:x}")
+doc.add_paragraph(f"Bit flipped: {bit_to_flip}")
+doc.add_paragraph(f"Iterations: {iterations}")
+doc.add_paragraph("")
+
+# Function to safely interrupt target
+def safe_interrupt():
+    for _ in range(3):
+        try:
+            gdbmi.write("interrupt")
+            return
+        except Exception:
+            time.sleep(1)
+# Run fault injection
+for i in range(iterations):
+    doc.add_heading(f"Iteration {i+1}", level=1)
+    safe_interrupt()
+    time.sleep(0.5)
+
+    # Read 4 bytes from the instruction address (big endian word)
+    read_resp = gdbmi.write(
+        f'-data-read-memory 0x{instruction_address:x} x 1 4 4 1'
+    )
+
+    original = None
+    for r in read_resp:
+        if r["type"] == "result" and "payload" in r:
+            mem = r["payload"].get("memory")
+            if mem and isinstance(mem, list):
+                contents = mem[0].get("contents")
+                if contents:
+                    try:
+                        original = int(contents, 16)
+                    except:
+                        original = None
+                    break
+
+    if original is None:
+        doc.add_paragraph(f"[-] Could not read instruction at 0x{instruction_address:x}")
+        doc.add_paragraph("")
+        time.sleep(delay_seconds)
+        continue
+
+    # Flip the bit
+    corrupted = original ^ (1 << bit_to_flip)
+
+    # Write the corrupted instruction back
+    gdbmi.write(f"set {{int}}0x{instruction_address:x} = {corrupted}")
+
+    doc.add_paragraph(
+        f"Instruction at 0x{instruction_address:x}: original=0x{original:08x}, bit {bit_to_flip} flip>    )
+    doc.add_paragraph("")
+    time.sleep(delay_seconds)
+
+# Save the report
+report_path = "/mnt/f/loggins_instruction_corruption/instruction_corruption_fault_report.docx"
+doc.save(report_path)
+gdbmi.exit()
+
