@@ -1,0 +1,86 @@
+from pygdbmi.gdbcontroller import GdbController
+from docx import Document
+from datetime import datetime
+import time
+
+registers_to_test = ['x10', 'x11', 'x12']  # Registers to inject faults into
+iterations_per_mode = 25  # 25 stuck-at-1 + 25 stuck-at-0
+delay_seconds = 2
+
+# Setup GDB MI controller without timeout_sec (fixes your error)
+gdbmi = GdbController(command=["gdb-multiarch", "--nx", "--interpreter=mi3"])
+gdbmi.write('-target-select remote localhost:1234')
+time.sleep(1)
+
+doc = Document()
+doc.add_heading('Stuck-At Fault Injection Report', 0)
+doc.add_paragraph(f'Test started: {datetime.now()}')
+doc.add_paragraph(f'Registers tested: {", ".join(registers_to_test)}')
+doc.add_paragraph(f'Iterations per mode: {iterations_per_mode}')
+doc.add_paragraph('Fault modes: stuck-at-1 then stuck-at-0')
+doc.add_paragraph('')
+
+def safe_interrupt():
+    for attempt in range(3):
+        try:
+            resp = gdbmi.write('interrupt')
+            return resp
+        except Exception:
+            time.sleep(1)
+    raise Exception("GDB did not respond to interrupt after retries.")
+
+# Run stuck-at-1 faults
+for i in range(iterations_per_mode):
+    doc.add_heading(f'Iteration stuck-at-1: {i+1}', level=1)
+    safe_interrupt()
+    time.sleep(0.5)
+    for reg in registers_to_test:
+        resp = gdbmi.write(f'-data-evaluate-expression ${reg}')
+        current_val = None
+        for r in resp:
+            if r['type'] == 'result' and 'payload' in r:
+                val_str = r['payload'].get('value')
+                if val_str:
+                    try:
+                        current_val = int(val_str, 16)
+                    except ValueError:
+                        current_val = None
+                  break
+        if current_val is None:
+            doc.add_paragraph(f'[-] Could not read register {reg}')
+            continue
+        stuck_at_val = current_val | (1 << 3)  # Stuck bit 3 at 1
+        gdbmi.write(f'set ${reg} = {stuck_at_val}')
+        doc.add_paragraph(f'Register {reg}: initial=0x{current_val:x}, stuck-at-1 bit 3 → 0x{stuck_at>    doc.add_paragraph('')
+    time.sleep(delay_seconds)
+
+# Run stuck-at-0 faults
+for i in range(iterations_per_mode):
+    doc.add_heading(f'Iteration stuck-at-0: {i+1}', level=1)
+    safe_interrupt()
+    time.sleep(0.5)
+    for reg in registers_to_test:
+        resp = gdbmi.write(f'-data-evaluate-expression ${reg}')
+        current_val = None
+        for r in resp:
+            if r['type'] == 'result' and 'payload' in r:
+                val_str = r['payload'].get('value')
+                if val_str:
+                    try:
+                        current_val = int(val_str, 16)
+                    except ValueError:
+                        current_val = None
+                    break
+        if current_val is None:
+            doc.add_paragraph(f'[-] Could not read register {reg}')
+            continue
+        stuck_at_val = current_val & ~(1 << 3)  # Stuck bit 3 at 0
+        gdbmi.write(f'set ${reg} = {stuck_at_val}')
+        doc.add_paragraph(f'Register {reg}: initial=0x{current_val:x}, stuck-at-0 bit 3 → 0x{stuck_at>    doc.add_paragraph('')
+    time.sleep(delay_seconds)
+
+report_path = '/mnt/f/loggins_stuck_at/stuck_at_fault_report.docx'
+doc.save(report_path)
+print(f'[+] Completed stuck-at faults. Report saved at {report_path}')
+gdbmi.exit()
+ 
