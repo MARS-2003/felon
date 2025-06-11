@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+import time, socket, json, re, logging
+from docx import Document
+from datetime import datetime
+QMP_SOCKET = "/tmp/qmp-sock"
+REGISTERS = ["ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3"]
+REPORT_PATH = "/mnt/f/loggins/timing_violation_report.docx"
+MAX_RETRIES = 20
+SLEEP_BETWEEN = 0.5
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+print("== Fault Injection Starting ==")
+def qmp_connect():
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(2)
+_ = sock.recv(4096) # greeting
+sock.send(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+_ = sock.recv(4096)
+return sock
+def send_qmp(sock, cmd):
+sock.send((json.dumps(cmd) + "\n").encode())
+return sock.recv(4096).decode(errors='ignore')
+def get_gprs(raw_text):
+"""Extract register values from xN/NAME format."""
+matches = re.findall(r"x\d+/(\w+)\s+([0-9a-f]{16})", raw_text, re.IGNORECASE)
+return {name: int(val, 16) for name, val in matches if name in REGISTERS}
+def flip_bit(val, bit=63):
+return val ^ (1 << bit)
+sock = qmp_connect()
+doc = Document()
+doc.add_heading("Timing Violation Fault Injection Report", 0)
+doc.add_paragraph(f"Start time: {datetime.now().isoformat()}")
+doc.add_paragraph(f"Registers: {', '.join(REGISTERS)}")
+doc.add_paragraph(f"Bit flipped: MSB (bit 63)")
+doc.add_paragraph("")
+for iteration in range(1, 4):
+logging.info(f"--- Iteration {iteration}/3 ---")
+doc.add_heading(f"Iteration {iteration}", level=1)
+send_qmp(sock, {"execute": "stop"})
+time.sleep(SLEEP_BETWEEN)
+regs = {}
+for attempt in range(MAX_RETRIES):
+out = send_qmp(sock, {
+"execute": "human-monitor-command",
+"arguments": {"command-line": "info registers"}
+})
+regs = get_gprs(out)
+if regs:
+break
+time.sleep(SLEEP_BETWEEN)
+if not regs:
+logging.warning("No valid registers parsed.")
+doc.add_paragraph("No valid registers parsed.")
+else:
+for reg in REGISTERS:
+if reg not in regs:
+continue
+val = regs[reg]
+flipped = flip_bit(val)
+cmd = f"set ${reg} = 0x{flipped:016x}"
+send_qmp(sock, {
+"execute": "human-monitor-command",
+"arguments": {"command-line": cmd}
+})
+log = f"{reg}: 0x{val:016x} → 0x{flipped:016x}"
+logging.info(log)
+doc.add_paragraph(log)
+send_qmp(sock, {"execute": "cont"})
+time.sleep(SLEEP_BETWEEN)
+doc.save(REPORT_PATH)
+logging.info(f"Report saved to {REPORT_PATH}")
+print("== All iterations complete. Report ready ==")
