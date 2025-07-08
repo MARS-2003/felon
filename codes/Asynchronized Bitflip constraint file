@@ -1,0 +1,15 @@
+## Clock input (100 MHz)
+set_property PACKAGE_PIN E3 [get_ports clk_100mhz]
+set_property IOSTANDARD LVCMOS33 [get_ports clk_100mhz]
+
+## Switch 9 (SW9 - U8)
+set_property PACKAGE_PIN U8 [get_ports sw]
+set_property IOSTANDARD LVCMOS18 [get_ports sw]
+
+## LED9 (T15)
+set_property PACKAGE_PIN T15 [get_ports led]
+set_property IOSTANDARD LVCMOS33 [get_ports led]
+
+## PMOD JC1 (K1)
+set_property PACKAGE_PIN K1 [get_ports pmod_out]
+set_property IOSTANDARD LVCMOS33 [get_ports pmod_out]

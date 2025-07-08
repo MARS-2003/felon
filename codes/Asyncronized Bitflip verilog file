@@ -1,0 +1,49 @@
+module pulse_train(
+    input wire clk_100mhz,
+    input wire sw,
+    output wire led,
+    (* keep = "true" *) output wire pmod_out
+);
+
+wire clk_out;
+
+clk_wiz_0 clkgen (
+    .clk_in1(clk_100mhz),
+    .clk_out1(clk_out),
+    .reset(1'b0),
+    .locked()
+);
+
+reg [3:0] counter = 0;
+reg pulse = 0;
+
+always @(posedge clk_out) begin
+    if (counter == 9) begin
+        counter <= 0;
+        pulse <= 1;
+    end else if (counter == 0) begin
+        pulse <= 0;
+        counter <= counter + 1;
+    end else begin
+        pulse <= 0;
+        counter <= counter + 1;
+    end
+end
+
+reg led_reg = 0;
+reg pmod_reg = 0;
+
+always @(posedge clk_out) begin
+    if (sw) begin
+        led_reg <= pulse;
+        pmod_reg <= pulse;
+    end else begin
+        led_reg <= 0;
+        pmod_reg <= 0;
+    end
+end
+
+assign led = led_reg;
+assign pmod_out = pmod_reg;
+
+endmodule
