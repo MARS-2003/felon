@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+# motrt_infer_crisp_ema.py
+# Fast TensorRT live inference with EMA heatmap suppression of ghost detections (Jetson Nano friendly).
+# Keeps early-prune + vectorized NMS, adds a tiny EMA grid (~52x52 for 416 input) to require temporal+spatial consistency.
+
+import os, time
+import numpy as np
+import cv2
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+
+# ---------------- USER TUNABLES ----------------
+TRT_PATH = "/home/edgeai/Downloads/my_model.trt"
+CAM_ID = 0
+BATCH = 1
+
+PRE_N = 200                # anchors to keep for heavier ops
+TOP_K = 60                 # cap before NMS
+CLASS_CONF_THRES = 0.55    # primary class-sig gate
+OBJ_THRES = 0.25
+CLUSTER_IOU = 0.45
+NEIGHBOR_MIN = 2
+CLUSTER_SCORE_SUM_MIN = 1.0
+HIGH_CONF_OVERRIDE = 0.92
+NMS_IOU = 0.45
+MIN_BOX_AREA = 16
+FALLBACK_DRAW_TOPK = 0
+DEBUG_PRINT = True
+CLASSES_TXT = "classes.txt"
+# EMA heatmap params (main new addition)
+EMA_ALPHA = 0.20          # EMA smoothing (0..1). Higher -> faster update
+EMA_THRESH = 0.03        # require EMA at cluster cell >= this to accept (tunable)
+GRID_SUBSAMPLE = 8       # downsample factor from model resolution (416/8=52)
+# ------------------------------------------------
+
+def sigmoid(x): return 1.0/(1.0+np.exp(-x))
+
+def load_class_names(path):
+    if os.path.isfile(path):
+        with open(path,"r") as f:
+            names = [x.strip() for x in f.readlines() if x.strip()]
+        if names: return names
+    return [f"class_{i}" for i in range(256)]
+
+CLASS_NAMES = load_class_names(CLASSES_TXT)
+
+def xywh2xyxy(xywh):
+    xc = xywh[:,0]; yc = xywh[:,1]; w = xywh[:,2]; h = xywh[:,3]
+    x1 = xc - 0.5*w; y1 = yc - 0.5*h
+    x2 = xc + 0.5*w; y2 = yc + 0.5*h
+    return np.stack([x1,y1,x2,y2], axis=1)
+
+def iou_matrix(A, B):
+    if A.shape[0] == 0 or B.shape[0] == 0:
+        return np.zeros((A.shape[0], B.shape[0]), dtype=np.float32)
+    Ax1 = A[:,0:1]; Ay1 = A[:,1:2]; Ax2 = A[:,2:3]; Ay2 = A[:,3:4]
+    Bx1 = B[:,0][None,:]; By1 = B[:,1][None,:]; Bx2 = B[:,2][None,:]; By2 = B[:,3][None,:]
+    xx1 = np.maximum(Ax1, Bx1)
+    yy1 = np.maximum(Ay1, By1)
+    xx2 = np.minimum(Ax2, Bx2)
+    yy2 = np.minimum(Ay2, By2)
+    w = np.maximum(0.0, xx2 - xx1)
+    h = np.maximum(0.0, yy2 - yy1)
+    inter = w * h
+    areaA = (Ax2 - Ax1) * (Ay2 - Ay1)
+    areaB = (Bx2 - Bx1) * (By2 - By1)
+    union = areaA + areaB - inter + 1e-9
+    return (inter / union).astype(np.float32)
+
+def nms_numpy(boxes, scores, iou_thres):
+    if boxes.shape[0] == 0:
+        return np.array([], dtype=np.int32)
+    x1 = boxes[:,0]; y1 = boxes[:,1]; x2 = boxes[:,2]; y2 = boxes[:,3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]; keep.append(i)
+        if order.size == 1: break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
+        inds = np.where(iou <= iou_thres)[0]
+        order = order[inds + 1]
+    return np.array(keep, dtype=np.int32)
+
+# --- load TRT engine ---
+if not os.path.isfile(TRT_PATH):
+    raise SystemExit("TRT engine not found: " + TRT_PATH)
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+with open(TRT_PATH,"rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+    engine = runtime.deserialize_cuda_engine(f.read())
+context = engine.create_execution_context()
+
+# IO bindings
+input_idx = None; output_idx = None
+for i in range(engine.num_bindings):
+    if engine.binding_is_input(i): input_idx = i
+    else: output_idx = i
+if input_idx is None or output_idx is None:
+    raise SystemExit("Cannot find input/output bindings in engine")
+
+in_shape = tuple(int(x) for x in engine.get_binding_shape(input_idx))
+out_shape = tuple(int(x) for x in engine.get_binding_shape(output_idx))
+if len(in_shape) != 4:
+    raise SystemExit(f"Unexpected input shape: {in_shape}")
+_, C, H_model, W_model = in_shape
+print(f"Engine input (C,H,W)=({C},{H_model},{W_model}) out_shape={out_shape}")
+
+# allocate buffers (robust)
+stream = cuda.Stream()
+bindings = [None] * engine.num_bindings
+host_buffers = {}
+dev_buffers = {}
+for i in range(engine.num_bindings):
+    shape = tuple(int(x) if int(x) > 0 else 1 for x in engine.get_binding_shape(i))
+    dtype_np = trt.nptype(engine.get_binding_dtype(i))
+    size = int(np.prod(shape))
+    host_mem = cuda.pagelocked_empty(size, dtype_np)
+    dev_mem = cuda.mem_alloc(host_mem.nbytes)
+    bindings[i] = int(dev_mem)
+    host_buffers[i] = (host_mem, shape)
+    dev_buffers[i] = dev_mem
+
+# EMA heatmap init (grid derived from model dims and GRID_SUBSAMPLE)
+grid_w = max(1, W_model // GRID_SUBSAMPLE)
+grid_h = max(1, H_model // GRID_SUBSAMPLE)
+ema_map = np.zeros((grid_h, grid_w), dtype=np.float32)
+
+# camera init
+cap = cv2.VideoCapture(CAM_ID)
+if not cap.isOpened():
+    raise SystemExit("Cannot open camera")
+
+frame_i = 0
+prev_time = time.time()
+
+try:
+    while True:
+        t0 = time.time()
+        ret, frame = cap.read()
+        if not ret: break
+        H_img, W_img = frame.shape[:2]
+
+        # preprocess
+        img = cv2.resize(frame, (W_model, H_model))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        arr = img.astype(np.float32) / 255.0
+        arr = arr.transpose(2,0,1)
+        inp = np.ascontiguousarray(arr.reshape(BATCH, C, H_model, W_model))
+
+        # copy input
+        in_host, _ = host_buffers[input_idx]
+        needed = inp.size
+        np.copyto(np.frombuffer(in_host, dtype=inp.dtype, count=needed), inp.ravel())
+        cuda.memcpy_htod_async(dev_buffers[input_idx], in_host, stream)
+
+        # inference
+        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+
+        # get output
+        out_host, out_shape_buf = host_buffers[output_idx]
+        cuda.memcpy_dtoh_async(out_host, dev_buffers[output_idx], stream)
+        stream.synchronize()
+
+        # reshape robustly
+        flat = np.array(out_host, copy=False)
+        try:
+            arr_out = flat.reshape(out_shape_buf)
+        except Exception:
+            try:
+                arr_out = flat.reshape((BATCH, int(out_shape_buf[1]), -1))
+            except Exception:
+                arr_out = flat.reshape((1, -1))
+        if arr_out.ndim == 4:
+            arr_out = arr_out.reshape(BATCH, arr_out.shape[1], -1)
+        elif arr_out.ndim == 3:
+            pass
+        elif arr_out.ndim == 2:
+            if arr_out.shape[0] == BATCH:
+                arr_out = arr_out.reshape(BATCH, 1, -1)
+            else:
+                arr_out = arr_out.reshape(BATCH, arr_out.shape[1], -1)
+
+        preds = arr_out.transpose(0,2,1)[0]   # (N, C_out)
+        if preds.ndim != 2 or preds.shape[1] < 6:
+            print("Unexpected preds shape:", preds.shape); break
+
+        # decode
+        xywh = preds[:, :4].astype(np.float32)      # model-space
+        obj_raw = preds[:, 4].astype(np.float32)
+        class_raw = preds[:, 5:].astype(np.float32)
+
+        obj_sig = sigmoid(obj_raw)
+        cls_sig = sigmoid(class_raw)
+        cls_sig_max = cls_sig.max(axis=1)
+        cls_argmax = np.argmax(cls_sig, axis=1)
+
+        # ranking: obj * class
+        rank_scores = obj_sig * cls_sig_max
+
+        # early prune PRE_N by rank
+        N_total = rank_scores.shape[0]
+        k = min(PRE_N, N_total)
+        if k < N_total:
+            topk_idx = np.argpartition(-rank_scores, k-1)[:k]
+            topk_scores = rank_scores[topk_idx]
+            order = topk_scores.argsort()[::-1]
+            cand_idx = topk_idx[order]
+        else:
+            cand_idx = np.arange(N_total)
+
+        cand_xywh = xywh[cand_idx]
+        cand_boxes = xywh2xyxy(cand_xywh)
+        cand_scores = cls_sig_max[cand_idx]   # gating by class sigmoid
+        cand_obj = obj_sig[cand_idx]
+        cand_cls = cls_argmax[cand_idx]
+
+        # primary gate
+        class_mask = cand_scores >= CLASS_CONF_THRES
+        if obj_sig.std() > 0.01:
+            class_mask &= (cand_obj[cand_idx] >= OBJ_THRES)
+        mask_idxs = np.where(class_mask)[0]
+
+        # if nothing passes -> show FPS and continue (no fallback)
+        if mask_idxs.size == 0:
+            t1 = time.time(); fps = 1.0/(t1 - t0 + 1e-9)
+            cv2.putText(frame, f"FPS: {fps:.1f} dets:0", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            cv2.imshow("TRT", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            frame_i += 1; prev_time = t1; continue
+
+        cand_boxes = cand_boxes[mask_idxs]
+        cand_scores = cand_scores[mask_idxs]
+        cand_cls = cand_cls[mask_idxs]
+        cand_xywh = cand_xywh[mask_idxs]
+
+        # drop tiny boxes (model-space area)
+        areas = (cand_boxes[:,2] - cand_boxes[:,0]) * (cand_boxes[:,3] - cand_boxes[:,1])
+        area_keep = np.where(areas >= MIN_BOX_AREA)[0]
+        if area_keep.size == 0:
+            t1 = time.time(); fps = 1.0/(t1 - t0 + 1e-9)
+            cv2.putText(frame, f"FPS: {fps:.1f} dets:0(tiny)", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            cv2.imshow("TRT", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            frame_i += 1; prev_time = t1; continue
+
+        cand_boxes = cand_boxes[area_keep]
+        cand_scores = cand_scores[area_keep]
+        cand_cls = cand_cls[area_keep]
+        cand_xywh = cand_xywh[area_keep]
+
+        # cap to TOP_K
+        if cand_boxes.shape[0] > TOP_K:
+            idx_topk = np.argsort(-cand_scores)[:TOP_K]
+            cand_boxes = cand_boxes[idx_topk]
+            cand_scores = cand_scores[idx_topk]
+            cand_cls = cand_cls[idx_topk]
+            cand_xywh = cand_xywh[idx_topk]
+
+        M = cand_boxes.shape[0]
+        if M == 0:
+            t1 = time.time(); fps = 1.0/(t1 - t0 + 1e-9)
+            cv2.putText(frame, f"FPS: {fps:.1f} dets:0", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            cv2.imshow("TRT", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            frame_i += 1; prev_time = t1; continue
+
+        # compute IoU matrix (M x M)
+        iou_mat = iou_matrix(cand_boxes, cand_boxes)
+
+        # greedy cluster creation (seed by score)
+        order = cand_scores.argsort()[::-1]
+        visited = np.zeros(M, dtype=bool)
+        clusters = []
+        for s in order:
+            if visited[s]: continue
+            cluster_set = {int(s)}
+            added = True
+            while added:
+                added = False
+                members = np.array(list(cluster_set), dtype=np.int32)
+                iou_to_cluster = iou_mat[members].max(axis=0)
+                new_idxs = np.where((iou_to_cluster >= CLUSTER_IOU) & (~np.isin(np.arange(M), list(cluster_set))))[0]
+                if new_idxs.size > 0:
+                    for ni in new_idxs:
+                        if ni not in cluster_set:
+                            cluster_set.add(int(ni)); added = True
+            cluster_list = np.array(sorted(cluster_set), dtype=np.int32)
+            visited[cluster_list] = True
+            clusters.append(cluster_list)
+
+        # Build current-frame tiny heatmap from candidate centers weighted by candidate scores
+        # map cand_xywh centers to the small grid
+        centers_x = cand_xywh[:,0]  # model-space x center (0..W_model)
+        centers_y = cand_xywh[:,1]
+        gx = np.clip((centers_x / float(W_model) * grid_w).astype(np.int32), 0, grid_w-1)
+        gy = np.clip((centers_y / float(H_model) * grid_h).astype(np.int32), 0, grid_h-1)
+        current_map = np.zeros_like(ema_map)
+        # accumulate sum of scores per cell
+        for cx, cy, s in zip(gx, gy, cand_scores):
+            current_map[cy, cx] += float(s)
+
+        # normalize current_map (optional) — keep it as raw score sum
+        # update EMA: ema = EMA_ALPHA * current + (1-EMA_ALPHA) * ema
+        ema_map = EMA_ALPHA * current_map + (1.0 - EMA_ALPHA) * ema_map
+
+        # evaluate clusters: require cluster mass and EMA support
+        kept_clusters = []
+        for cluster in clusters:
+            cluster_scores = cand_scores[cluster]
+            cluster_sum = float(cluster_scores.sum())
+            cluster_max = float(cluster_scores.max())
+            cluster_size = int(cluster.size)
+            # compute cluster center (score-weighted)
+            boxes_idxs = cluster
+            # cluster center using xywh
+            b = cand_xywh[boxes_idxs]
+            xcs = b[:,0]; ycs = b[:,1]
+            weights = cluster_scores
+            wsum = weights.sum() + 1e-9
+            xc = float((xcs * weights).sum() / wsum)
+            yc = float((ycs * weights).sum() / wsum)
+            # map center to EMA grid
+            gx_c = int(np.clip((xc / float(W_model) * grid_w), 0, grid_w-1))
+            gy_c = int(np.clip((yc / float(H_model) * grid_h), 0, grid_h-1))
+            ema_val = float(ema_map[gy_c, gx_c])
+            # decide acceptance:
+            accept = False
+            if cluster_size >= NEIGHBOR_MIN and cluster_sum >= CLUSTER_SCORE_SUM_MIN and ema_val >= EMA_THRESH:
+                accept = True
+            if cluster_max >= HIGH_CONF_OVERRIDE:
+                accept = True
+            # also accept if ema is fairly high (even if cluster marginal)
+            if ema_val >= (EMA_THRESH * 3.0) and cluster_sum >= (CLUSTER_SCORE_SUM_MIN * 0.6):
+                accept = True
+            if accept:
+                kept_clusters.append((cluster, xc, yc, cluster_sum, cluster_max))
+
+        if len(kept_clusters) == 0:
+            # strong suppression: nothing to show
+            t1 = time.time(); fps = 1.0/(t1 - t0 + 1e-9)
+            cv2.putText(frame, f"FPS: {fps:.1f} dets:0(suppressed)", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            cv2.imshow("TRT", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            frame_i += 1; prev_time = t1; continue
+
+        # for each kept cluster, form weighted bbox (score-weighted average of xywh)
+        cluster_boxes = []
+        cluster_scores_out = []
+        cluster_cls_out = []
+        for (cluster, xc, yc, cluster_sum, cluster_max) in kept_clusters:
+            idxs = cluster
+            scores_w = cand_scores[idxs]
+            b = cand_xywh[idxs]
+            wsum = scores_w.sum() + 1e-9
+            xywh_weighted = (b * scores_w[:,None]).sum(axis=0) / wsum
+            xc_w, yc_w, ww, hh = xywh_weighted
+            x1r = xc_w - 0.5*ww; y1r = yc_w - 0.5*hh
+            x2r = xc_w + 0.5*ww; y2r = yc_w + 0.5*hh
+            cluster_boxes.append([x1r,y1r,x2r,y2r])
+            cluster_scores_out.append(float(cluster_max))
+            # majority class inside cluster (tie-break by highest per-cluster score)
+            cls_candidates = cand_cls[idxs]
+            vals, counts = np.unique(cls_candidates, return_counts=True)
+            best_cls = vals[counts.argmax()]
+            cluster_cls_out.append(int(best_cls))
+
+        cluster_boxes = np.array(cluster_boxes, dtype=np.float32)
+        cluster_scores_out = np.array(cluster_scores_out, dtype=np.float32)
+        cluster_cls_out = np.array(cluster_cls_out, dtype=np.int32)
+
+        # final global NMS on cluster boxes
+        if cluster_boxes.shape[0] > 1:
+            keepg = nms_numpy(cluster_boxes, cluster_scores_out, NMS_IOU)
+            cluster_boxes = cluster_boxes[keepg]
+            cluster_scores_out = cluster_scores_out[keepg]
+            cluster_cls_out = cluster_cls_out[keepg]
+
+        # draw scaled boxes
+        sx = float(W_img)/float(W_model); sy = float(H_img)/float(H_model)
+        boxes_img = cluster_boxes.copy()
+        boxes_img[:,[0,2]] *= sx
+        boxes_img[:,[1,3]] *= sy
+
+        for box, score, cid in zip(boxes_img, cluster_scores_out, cluster_cls_out):
+            x1,y1,x2,y2 = map(int, box)
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (16,200,16), 2)
+            label = f"{CLASS_NAMES[cid] if cid < len(CLASS_NAMES) else cid}:{score:.2f}"
+            cv2.putText(frame, label, (x1, max(0,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+        t1 = time.time()
+        fps = 1.0/(t1 - t0 + 1e-9)
+        if DEBUG_PRINT:
+            print(f"[frame {frame_i}] anchors_pruned={len(cand_idx)} cand={M} clusters={len(clusters)} kept={len(kept_clusters)} final={cluster_boxes.shape[0]} fps={fps:.2f} ema_max={ema_map.max():.3f}")
+
+        cv2.putText(frame, f"FPS: {fps:.1f} dets:{cluster_boxes.shape[0]}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        cv2.imshow("TRT", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+        frame_i += 1
+        prev_time = t1
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
