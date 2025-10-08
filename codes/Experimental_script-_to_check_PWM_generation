@@ -1,0 +1,27 @@
+import os, time, sys
+
+gpio = 79
+freq = 500.0
+duty = 50.0  # percent
+
+period = 1.0 / freq
+on_time = period * (duty / 100.0)
+off_time = period - on_time
+
+path = f"/sys/class/gpio/gpio{gpio}"
+if not os.path.exists(path):
+    with open("/sys/class/gpio/export", "w") as f: f.write(str(gpio))
+    time.sleep(0.05)
+with open(f"{path}/direction", "w") as f: f.write("out")
+fd = os.open(f"{path}/value", os.O_WRONLY)
+
+try:
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET); os.write(fd, b'1'); time.sleep(on_time)
+        os.lseek(fd, 0, os.SEEK_SET); os.write(fd, b'0'); time.sleep(off_time)
+except KeyboardInterrupt:
+    os.lseek(fd, 0, os.SEEK_SET); os.write(fd, b'0')
+    os.close(fd)
+    print("PWM stopped")
+
+#has to be run with sudo, and the PIN to be tested is 12 on the board
