@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+import os, time
+
+# === Pin definitions (Linux GPIO numbers) ===
+ENA = 79    # Left motors (PWM)
+IN1 = 15
+IN2 = 13
+
+ENB = 232   # Right motors (PWM)
+IN3 = 19
+IN4 = 20
+
+gpios = [ENA, IN1, IN2, ENB, IN3, IN4]
+
+# === PWM setup ===
+freq = 1800
+period = 1.0 / freq
+duty_high = period * 0.7   # ~70% duty
+duty_low = period - duty_high
+
+# --- export + direction setup ---
+for g in gpios:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+    os.system(f"echo out > /sys/class/gpio/gpio{g}/direction")
+
+# convenience paths
+path = {g: f"/sys/class/gpio/gpio{g}/value" for g in gpios}
+
+def write(gpio, val):
+    with open(path[gpio], "w") as f:
+        f.write("1" if val else "0")
+
+def set_dir(in1, in2, in3, in4):
+    write(IN1, in1); write(IN2, in2)
+    write(IN3, in3); write(IN4, in4)
+
+print("Running L298N test sequence at 500 Hz. Ctrl+C to stop.\n")
+
+try:
+    actions = [
+        ("forward",  (1,0,1,0)),
+        ("backward", (0,1,0,1)),
+        ("spin left",(0,1,1,0)),
+        ("spin right",(1,0,0,1)),
+        ("gentle left",(1,0,1,0)),
+        ("gentle right",(1,0,1,0)),
+    ]
+    for name, dirs in actions:
+        print(f"Action: {name}")
+        if "gentle left" in name:
+            left_duty = 0.4; right_duty = 0.7
+        elif "gentle right" in name:
+            left_duty = 0.7; right_duty = 0.4
+        else:
+            left_duty = right_duty = 0.7
+
+        set_dir(*dirs)
+        start = time.time()
+        while time.time() - start < 3.0:  # 3 seconds per action
+            # left side PWM
+            write(ENA, 1); time.sleep(period * left_duty)
+            write(ENA, 0); time.sleep(period * (1 - left_duty))
+            # right side PWM
+            write(ENB, 1); time.sleep(period * right_duty)
+            write(ENB, 0); time.sleep(period * (1 - right_duty))
+
+        # brief stop between actions
+        set_dir(0,0,0,0)
+        write(ENA,0); write(ENB,0)
+        time.sleep(1.0)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    set_dir(0,0,0,0)
+    write(ENA,0); write(ENB,0)
+    print("\nAll pins LOW. Done.")
