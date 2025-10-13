@@ -2,13 +2,13 @@
 import os, time
 
 # === Pin definitions (Linux GPIO numbers) ===
-ENA = 79    # Left motors (PWM)
-IN1 = 15
-IN2 = 13
+ENA = 79    # boardPin(PWM) 12
+IN1 = 15    # boardPin(IN1) 18
+IN2 = 13    # boardPin(IN2) 22
 
-ENB = 232   # Right motors (PWM)
-IN3 = 19
-IN4 = 20
+ENB = 232   # boardPin(PWM) 16
+IN3 = 19    # boardPin(IN3) 24
+IN4 = 20    # boardPin(IN4) 26
 
 gpios = [ENA, IN1, IN2, ENB, IN3, IN4]
 
