@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+import os, time
+
+# === Pin setup ===
+TRIG = 50 #boardPin11
+ECHO = 14 #boardPin13
+gpios = [TRIG, ECHO]
+
+# === Export and configure ===
+for g in gpios:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+os.system(f"echo out > /sys/class/gpio/gpio{TRIG}/direction")
+os.system(f"echo in > /sys/class/gpio/gpio{ECHO}/direction")
+
+# === GPIO value file paths ===
+trig_path = f"/sys/class/gpio/gpio{TRIG}/value"
+echo_path = f"/sys/class/gpio/gpio{ECHO}/value"
+
+def write_pin(gpio_path, value):
+    with open(gpio_path, "w") as f:
+        f.write("1" if value else "0")
+
+def read_pin(gpio_path):
+    with open(gpio_path, "r") as f:
+        return f.read().strip() == "1"
+
+def measure_distance():
+    # Send 10µs pulse on TRIG
+    write_pin(trig_path, 0)
+    time.sleep(0.000002)
+    write_pin(trig_path, 1)
+    time.sleep(0.00001)
+    write_pin(trig_path, 0)
+
+    # Wait for ECHO to go HIGH
+    timeout = time.time() + 0.02  # 20ms safety
+    while not read_pin(echo_path):
+        if time.time() > timeout:
+            return None
+    start = time.time()
+
+    # Wait for ECHO to go LOW again
+    timeout = time.time() + 0.02
+    while read_pin(echo_path):
+        if time.time() > timeout:
+            return None
+    end = time.time()
+
+    # Calculate distance
+    duration = end - start
+    distance_cm = (duration * 34300) / 2
+    return round(distance_cm, 2)
+
+print("HC-SR04 Distance Sensor Active — press Ctrl+C to stop")
+
+try:
+    while True:
+        dist = measure_distance()
+        if dist is not None:
+            print(f"Distance: {dist} cm")
+        else:
+            print("Timeout — no echo received")
+        time.sleep(0.2)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    write_pin(trig_path, 0)
+    print("\nSensor stopped. TRIG set LOW.")
