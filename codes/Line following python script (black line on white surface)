@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import os, time, cv2, numpy as np
+
+# === GPIO Pin Mapping (Linux GPIO numbers) ===
+ENA, IN1, IN2 = 79, 15, 13
+ENB, IN3, IN4 = 232, 19, 20
+gpios = [ENA, IN1, IN2, ENB, IN3, IN4]
+
+# === PWM Configuration ===
+freq = 2500
+period = 1.0 / freq
+
+# === GPIO Setup ===
+for g in gpios:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+    os.system(f"echo out > /sys/class/gpio/gpio{g}/direction")
+
+path = {g: f"/sys/class/gpio/gpio{g}/value" for g in gpios}
+
+def write(g, v):
+    with open(path[g], "w") as f: f.write("1" if v else "0")
+
+def read(g):
+    with open(path[g], "r") as f: return f.read().strip()
+
+def set_dir(in1, in2, in3, in4):
+    write(IN1, in1); write(IN2, in2)
+    write(IN3, in3); write(IN4, in4)
+
+# === Camera Setup ===
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+# === Tuning Parameters ===
+ROI_FRACTION = 0.6
+CENTER_TOLERANCE = 20
+GENTLE_TURN_MARGIN = 60
+TURN_SPEED = 0.6
+FORWARD_SPEED = 0.7
+GENTLE_DIFF = 0.3
+
+kernel = np.ones((3,3), np.uint8)
+
+# === Line Detection with Pure Line-Only Tunnel Vision ===
+def detect_line_center(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+
+    # Detect the black line
+    mask = cv2.inRange(blur, 0, 60)
+
+    # Clean mask
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Tunnel vision: only line is white, everything else black
+    tunnel = np.zeros_like(frame)
+    tunnel[mask > 0] = [255, 255, 255]
+
+    # ROI for line center
+    h, w = mask.shape
+    roi = mask[int(h * ROI_FRACTION):h, :]
+    M = cv2.moments(roi)
+    if M["m00"] > 0:
+        cx = int(M["m10"]/M["m00"])
+        cy = int(M["m01"]/M["m00"]) + int(h * ROI_FRACTION)
+        return cx, cy, tunnel
+
+    return None, None, tunnel
+
+print("Line Follower Active — press ESC to stop")
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        cx, cy, tunnel = detect_line_center(frame)
+        h, w = frame.shape[:2]
+
+        if cx is None:
+            action, dirs = "lost", (0,0,0,0)
+            left_duty = right_duty = 0
+        else:
+            error = cx - w / 2
+
+            if abs(error) < CENTER_TOLERANCE:
+                action, dirs = "forward", (1,0,1,0)
+                left_duty = right_duty = FORWARD_SPEED
+            elif error >= CENTER_TOLERANCE and error < GENTLE_TURN_MARGIN:
+                action, dirs = "gentle_right", (1,0,1,0)
+                left_duty, right_duty = FORWARD_SPEED, FORWARD_SPEED - GENTLE_DIFF
+            elif error <= -CENTER_TOLERANCE and error > -GENTLE_TURN_MARGIN:
+                action, dirs = "gentle_left", (1,0,1,0)
+                left_duty, right_duty = FORWARD_SPEED - GENTLE_DIFF, FORWARD_SPEED
+            elif error >= GENTLE_TURN_MARGIN:
+                action, dirs = "turn_right", (1,0,0,1)
+                left_duty = right_duty = TURN_SPEED
+            elif error <= -GENTLE_TURN_MARGIN:
+                action, dirs = "turn_left", (0,1,1,0)
+                left_duty = right_duty = TURN_SPEED
+
+        set_dir(*dirs)
+
+        t0 = time.time()
+        while time.time() - t0 < 0.05:
+            write(ENA, 1); time.sleep(period * left_duty)
+            write(ENA, 0); time.sleep(period * (1 - left_duty))
+            write(ENB, 1); time.sleep(period * right_duty)
+            write(ENB, 0); time.sleep(period * (1 - right_duty))
+
+        ins = tuple(read(g) for g in [IN1, IN2, IN3, IN4])
+        print(f"{action:<12} | Center=({cx}) | INs={ins}")
+
+        cv2.imshow("tunnel", tunnel)
+        if cv2.waitKey(1) == 27:
+            break
+
+except KeyboardInterrupt:
+    pass
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    set_dir(0,0,0,0)
+    write(ENA,0); write(ENB,0)
+    print("\nAll pins LOW — stopped.")
