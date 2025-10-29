@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import os, time, cv2, numpy as np
+
+# === GPIO Pin Mapping ===
+ENA, IN1, IN2 = 79, 15, 13
+ENB, IN3, IN4 = 232, 19, 20
+gpios = [ENA, IN1, IN2, ENB, IN3, IN4]
+
+# === PWM Configuration ===
+freq = 2500
+period = 1.0 / freq
+
+# === Robot Dimensions ===
+WHEELBASE = 0.15   # meters
+TRACK_WIDTH = 0.15  # meters
+WHEEL_DIAM = 0.065  # meters
+
+# === GPIO Setup ===
+for g in gpios:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+    os.system(f"echo out > /sys/class/gpio/gpio{g}/direction")
+
+path = {g: f"/sys/class/gpio/gpio{g}/value" for g in gpios}
+
+def write(g, v):
+    with open(path[g], "w") as f: f.write("1" if v else "0")
+
+def set_dir(in1, in2, in3, in4):
+    write(IN1, in1); write(IN2, in2)
+    write(IN3, in3); write(IN4, in4)
+
+# === Camera Setup ===
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+# === Save Video Setup ===
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+out_path = os.path.expanduser("~/Downloads/line_follow_green_smooth.avi")
+out = cv2.VideoWriter(out_path, fourcc, 20.0, (320, 240))
+
+# === Line Detection Parameters ===
+ROI_FRACTION = 0.6
+kernel = np.ones((3,3), np.uint8)
+
+# === PID Parameters ===
+KP = 0.005       # proportional gain
+BASE_SPEED = 0.6 # base duty cycle
+MAX_SPEED = 0.8  # clamp max speed
+
+def detect_line_center(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_green = np.array([40, 50, 50])
+    upper_green = np.array([90, 255, 255])
+    mask = cv2.inRange(hsv, lower_green, upper_green)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    tunnel = np.zeros_like(frame)
+    tunnel[mask > 0] = [0, 255, 0]
+
+    h, w = mask.shape
+    roi = mask[int(h * ROI_FRACTION):h, :]
+    M = cv2.moments(roi)
+    if M["m00"] > 0:
+        cx = int(M["m10"]/M["m00"])
+        cy = int(M["m01"]/M["m00"]) + int(h * ROI_FRACTION)
+        return cx, cy, tunnel
+    return None, None, tunnel
+
+def compute_pwm(error):
+    correction = KP * error
+    left = np.clip(BASE_SPEED - correction, 0, MAX_SPEED)
+    right = np.clip(BASE_SPEED + correction, 0, MAX_SPEED)
+    return left, right
+
+print("Smooth Green Line Follower Active — press ESC to stop")
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        cx, cy, tunnel = detect_line_center(frame)
+        h, w = frame.shape[:2]
+
+        if cx is None:
+            left_duty = right_duty = 0
+            set_dir(0,0,0,0)
+            action = "lost"
+        else:
+            error = cx - w / 2
+            left_duty, right_duty = compute_pwm(error)
+            # Forward direction
+            set_dir(1,0,1,0)
+            action = f"error={error:.1f}"
+
+        # Apply PWM proportional to computed duty
+        t0 = time.time()
+        while time.time() - t0 < 0.05:
+            write(ENA,1); time.sleep(period * left_duty)
+            write(ENA,0); time.sleep(period * (1-left_duty))
+            write(ENB,1); time.sleep(period * right_duty)
+            write(ENB,0); time.sleep(period * (1-right_duty))
+
+        out.write(tunnel)
+        cv2.imshow("tunnel", tunnel)
+        if cv2.waitKey(1) == 27:
+            break
+
+finally:
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    set_dir(0,0,0,0)
+    write(ENA,0); write(ENB,0)
+    print(f"Stopped. Video saved to {out_path}")
