@@ -1,0 +1,49 @@
+#run this on colab.research.google.com
+import cv2
+import os
+from google.colab import files
+
+
+print("Please upload your MP4 video file:")
+uploaded = files.upload()
+
+
+for filename in uploaded.keys():
+    video_path = filename
+    print(f" Uploaded: {video_path}")
+
+
+output_dir = "extracted_frames"
+os.makedirs(output_dir, exist_ok=True)
+
+
+video = cv2.VideoCapture(video_path)
+
+
+if not video.isOpened():
+    print("Error: Could not open video.")
+else:
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Total frames to extract: {total_frames}")
+
+
+count = 0
+while True:
+    ret, frame = video.read()
+    if not ret:
+        break
+
+    frame_filename = os.path.join(output_dir, f"frame_{count:06d}.jpg")
+    cv2.imwrite(frame_filename, frame)
+    count += 1
+
+video.release()
+print(f"Extraction complete! Saved {count} frames to '{output_dir}'.")
+
+
+import shutil
+shutil.make_archive("frames_zip", 'zip', output_dir)
+print(" All frames zipped into frames_zip.zip")
+
+
+files.download("frames_zip.zip")
