@@ -1,0 +1,114 @@
+#run on colab.research.google.com
+# --- INSTALL DEPENDENCIES ---
+!pip install opencv-python
+
+import cv2
+import os
+import numpy as np
+import zipfile
+from google.colab import files
+
+# --- STEP 1: ASK USER TO UPLOAD A ZIP FILE ---
+print("Please upload a ZIP file containing your frames folder.")
+uploaded = files.upload()
+
+# Get the uploaded ZIP filename
+zip_name = list(uploaded.keys())[0]
+input_extract_folder = "/content/frames"
+
+# Extract uploaded ZIP
+os.makedirs(input_extract_folder, exist_ok=True)
+with zipfile.ZipFile(zip_name, 'r') as zip_ref:
+    zip_ref.extractall(input_extract_folder)
+
+print(f"Uploaded and extracted to: {input_extract_folder}")
+
+# --- SETUP DATASET FOLDERS ---
+dataset_root = "/content/dataset"
+output_images = f"{dataset_root}/images"
+output_labels = f"{dataset_root}/labels"
+output_preview = "/content/preview"  # not inside ZIP
+
+os.makedirs(output_images, exist_ok=True)
+os.makedirs(output_labels, exist_ok=True)
+os.makedirs(output_preview, exist_ok=True)
+
+# Create classes.txt
+with open(f"{dataset_root}/classes.txt", "w") as f:
+    f.write("track\n")
+
+print("Starting auto-labeling...")
+
+# Loop over extracted directory (handles nested folders)
+for root, dirs, files_list in os.walk(input_extract_folder):
+    for filename in files_list:
+        if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+
+        path = os.path.join(root, filename)
+        img = cv2.imread(path)
+        if img is None:
+            print("Failed to read:", filename)
+            continue
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_contour = None
+        best_score = -1
+
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w * h < 50:
+                continue
+            aspect = max(w, h) / (min(w, h) + 1e-6)
+            perimeter = cv2.arcLength(cnt, True)
+            score = aspect * perimeter
+
+            if score > best_score:
+                best_score = score
+                best_contour = cnt
+
+        if best_contour is None:
+            print("No valid contour:", filename)
+            continue
+
+        x, y, w, h = cv2.boundingRect(best_contour)
+        H, W = img.shape[:2]
+
+        xc = (x + w/2) / W
+        yc = (y + h/2) / H
+        nw = w / W
+        nh = h / H
+
+        # Save image
+        cv2.imwrite(os.path.join(output_images, filename), img)
+
+        # Save label
+        label_filename = filename.rsplit(".", 1)[0] + ".txt"
+        with open(os.path.join(output_labels, label_filename), "w") as f:
+            f.write(f"0 {xc} {yc} {nw} {nh}\n")
+
+        # Save preview
+        preview_img = img.copy()
+        cv2.rectangle(preview_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+        cv2.imwrite(os.path.join(output_preview, filename), preview_img)
+
+        print("Labeled:", filename)
+
+print("Labeling complete.")
+
+# --- CREATE CLEAN ZIP (WITHOUT PREVIEW FOLDER) ---
+zip_path = "/content/dataset.zip"
+print("Creating dataset.zip ...")
+
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    for root, dirs, files_list in os.walk(dataset_root):
+        for file in files_list:
+            file_path = os.path.join(root, file)
+            arcname = os.path.relpath(file_path, dataset_root)
+            zipf.write(file_path, arcname)
+
+print("Done. Download dataset.zip now.")
