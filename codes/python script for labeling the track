@@ -35,7 +35,7 @@ os.makedirs(output_preview, exist_ok=True)
 
 # Create classes.txt
 with open(f"{dataset_root}/classes.txt", "w") as f:
-    f.write("track\n")
+    f.write("_track\n")
 
 print("Starting auto-labeling...")
 
@@ -89,7 +89,7 @@ for root, dirs, files_list in os.walk(input_extract_folder):
         # Save label
         label_filename = filename.rsplit(".", 1)[0] + ".txt"
         with open(os.path.join(output_labels, label_filename), "w") as f:
-            f.write(f"0 {xc} {yc} {nw} {nh}\n")
+            f.write(f"1 {xc} {yc} {nw} {nh}\n")
 
         # Save preview
         preview_img = img.copy()
