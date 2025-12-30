@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+import os
+import cv2
+import time
+import threading
+
+import modified    # keep unchanged
+import Inference   # keep unchanged (must be imported in main thread for CUDA)
+
+# ---------------- Video Save Setup ----------------
+save_dir = os.path.expanduser("~/Downloads/Inference")
+os.makedirs(save_dir, exist_ok=True)
+video_filename = os.path.join(save_dir, "trt_output.mp4")
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+out_video = cv2.VideoWriter(video_filename, fourcc, 24.0, (320, 240))
+
+# ---------------- Camera Setup ----------------
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+# ---------------- Shared state ----------------
+latest_frame = None
+exit_flag = threading.Event()
+
+# ---------------- Line-following worker ----------------
+def line_worker():
+    """
+    Runs line-following work on CPU/GPIO. This must NOT touch CUDA/Inference.
+    Calls modified.detect_line_center(frame) which controls motors.
+    """
+    global latest_frame
+    while not exit_flag.is_set():
+        frame = None
+        # grab a copy of the latest_frame if available
+        if latest_frame is not None:
+            # copy to avoid race on the buffer
+            frame = latest_frame.copy()
+        if frame is not None:
+            try:
+                # call exactly the function your modified script provides
+                modified.detect_line_center(frame)
+            except Exception:
+                # guard so the worker doesn't die silently — print minimal info
+                import traceback
+                traceback.print_exc()
+        # tiny sleep to avoid tight spin
+        time.sleep(0.001)
+
+# ---------------- Start line worker thread ----------------
+t_line = threading.Thread(target=line_worker, daemon=True)
+t_line.start()
+
+print("Press ESC to stop")
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            # keep trying; don't exit on a single bad frame
+            time.sleep(0.01)
+            continue
+
+        # store/latest_frame for the worker (line follower)
+        latest_frame = frame
+
+        # --- Run TRT inference in MAIN THREAD (important!) ---
+        try:
+            trt_frame = Inference.run_frame(frame.copy())
+        except Exception:
+            # if inference throws, print traceback but keep going
+            import traceback
+            traceback.print_exc()
+            # fall back to showing the raw camera frame
+            trt_frame = frame.copy()
+
+        # ensure output is 320x240 for display + saving
+        trt_frame = cv2.resize(trt_frame, (320, 240))
+
+        # display and save
+        cv2.imshow("Object Detection", trt_frame)
+        out_video.write(trt_frame)
+
+        # ESC key to stop
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+finally:
+    # signal worker to stop and cleanup
+    exit_flag.set()
+    t_line.join(timeout=1.0)
+
+    cap.release()
+    out_video.release()
+    cv2.destroyAllWindows()
+    print(f"\nTRT video saved to: {video_filename}")
