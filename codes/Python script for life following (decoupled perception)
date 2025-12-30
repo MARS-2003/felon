@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import os, time, cv2, numpy as np
+
+# === GPIO Pin Mapping ===
+ENA, IN1, IN2 = 79, 15, 13
+ENB, IN3, IN4 = 232, 19, 20
+gpios_motor = [ENA, IN1, IN2, ENB, IN3, IN4]
+
+# === HC-SR04 Pins ===
+TRIG = 50
+ECHO = 14
+gpios_sensor = [TRIG, ECHO]
+
+# === PWM Configuration ===
+freq = 2500
+period = 1.0 / freq
+
+# === GPIO Setup ===
+for g in gpios_motor:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+    os.system(f"echo out > /sys/class/gpio/gpio{g}/direction")
+
+for g in gpios_sensor:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+
+os.system(f"echo out > /sys/class/gpio/gpio{TRIG}/direction")
+os.system(f"echo in > /sys/class/gpio/gpio{ECHO}/direction")
+
+# File paths
+path = {g: f"/sys/class/gpio/gpio{g}/value" for g in gpios_motor}
+trig_path = f"/sys/class/gpio/gpio{TRIG}/value"
+echo_path = f"/sys/class/gpio/gpio{ECHO}/value"
+
+# === GPIO Functions ===
+def write(g, v):
+    with open(path[g], "w") as f:
+        f.write("1" if v else "0")
+
+def write_pin(p, value):
+    with open(p, "w") as f:
+        f.write("1" if value else "0")
+
+def read_pin(p):
+    with open(p, "r") as f:
+        return f.read().strip() == "1"
+
+def set_dir(in1, in2, in3, in4):
+    write(IN1, in1)
+    write(IN2, in2)
+    write(IN3, in3)
+    write(IN4, in4)
+
+# === Ultrasound ===
+def measure_distance():
+    write_pin(trig_path, 0)
+    time.sleep(0.000002)
+    write_pin(trig_path, 1)
+    time.sleep(0.00001)
+    write_pin(trig_path, 0)
+
+    timeout = time.time() + 0.02
+    while not read_pin(echo_path):
+        if time.time() > timeout:
+            return None
+    start = time.time()
+
+    timeout = time.time() + 0.02
+    while read_pin(echo_path):
+        if time.time() > timeout:
+            return None
+    end = time.time()
+
+    duration = end - start
+    return round((duration * 34300) / 2, 2)
+
+# === Line Detection Params ===
+kernel = np.ones((3,3), np.uint8)
+ROI_FRACTION = 0.6
+
+# === PID ===
+KP = 0.005
+BASE_SPEED = 0.7
+MAX_SPEED = 0.95
+PWM_WINDOW = 0.035
+
+# === Stop distance ===
+OBSTACLE_THRESHOLD = 4.0
+
+
+# ==========================================================
+# ===  FUNCTION: Full behavior of original black.py     ====
+# ==========================================================
+def detect_line_center(frame):
+    """
+    EXACT behavior of the original black.py
+    No overlays, no annotations, no extra processing.
+    Only frame-in / frame-out, motors controlled normally.
+    """
+
+    # 1) ULTRASONIC STOP
+    dist = measure_distance()
+    if dist is not None and dist <= OBSTACLE_THRESHOLD:
+        set_dir(0, 0, 0, 0)
+        write(ENA, 0)
+        write(ENB, 0)
+        return frame  # same as black.py — nothing drawn, just return frame
+
+    # 2) BLACK LINE MASK
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_black = np.array([0, 0, 0])
+    upper_black = np.array([180, 255, 70])
+
+    mask = cv2.inRange(hsv, lower_black, upper_black)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # 3) REGION OF INTEREST + CENTROID
+    h, w = mask.shape
+    roi = mask[int(h * ROI_FRACTION):h, :]
+    M = cv2.moments(roi)
+
+    if M["m00"] > 0:
+        cx = int(M["m10"] / M["m00"])
+        error = cx - w/2
+
+        # HARD RIGHT
+        if error > 60:
+            left_duty = 0
+            right_duty = MAX_SPEED
+            set_dir(0, 1, 1, 0)
+
+        # HARD LEFT
+        elif error < -60:
+            left_duty = MAX_SPEED
+            right_duty = 0
+            set_dir(1, 0, 0, 1)
+
+        # STRAIGHT / SMALL CORRECTION
+        else:
+            left_duty  = BASE_SPEED - KP * error
+            right_duty = BASE_SPEED + KP * error
+            left_duty  = np.clip(left_duty, 0, MAX_SPEED)
+            right_duty = np.clip(right_duty, 0, MAX_SPEED)
+            set_dir(1, 0, 1, 0)
+
+    else:
+        # LOST LINE
+        left_duty = right_duty = 0
+        set_dir(0, 0, 0, 0)
+
+    # 4) PWM — unchanged
+    t0 = time.time()
+    while time.time() - t0 < PWM_WINDOW:
+        write(ENA, 1)
+        write(ENB, 1)
+        time.sleep(max(period * left_duty, period * right_duty))
+        write(ENA, 0)
+        write(ENB, 0)
+        time.sleep(max(period * (1 - right_duty), period * (1 - left_duty)))
+
+    # EXACTLY like black.py: return frame unchanged
+    return frame
