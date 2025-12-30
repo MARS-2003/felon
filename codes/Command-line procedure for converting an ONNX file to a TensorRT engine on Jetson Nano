@@ -1,0 +1,5 @@
+cd ~/Downloads/onnx #path to the saved ONNX file
+/usr/src/tensorrt/bin/trtexec \
+--onnx=my_model.onnx \                          #name of the ONNX file
+--saveEngine=my_model.engine--fp16 \            #precision for the engine
+--workspace=2048                                #build-time workspace 
