@@ -1,0 +1,15 @@
+!pip install git+https://github.com/ultralytics/ultralytics.git@main
+
+!pip install onnx onnxruntime onnx_graphsurgeon
+
+
+from ultralytics import YOLO
+
+model = YOLO("/content/my_model.pt")  # trained model
+model.export(
+    format='onnx',
+    opset=12,
+    imgsz=256,       # match training
+    dynamic=False,
+    task='detect'
+)
