@@ -1,128 +1,182 @@
 #!/usr/bin/env python3
 import os, time, cv2, numpy as np
+from datetime import datetime
 
-# === GPIO Pin Mapping (Linux GPIO numbers) ===
+# === GPIO Pin Mapping ===
 ENA, IN1, IN2 = 79, 15, 13
 ENB, IN3, IN4 = 232, 19, 20
-gpios = [ENA, IN1, IN2, ENB, IN3, IN4]
+gpios_motor = [ENA, IN1, IN2, ENB, IN3, IN4]
+
+# === HC-SR04 Pins ===
+TRIG = 50
+ECHO = 14
+gpios_sensor = [TRIG, ECHO]
 
 # === PWM Configuration ===
 freq = 2500
 period = 1.0 / freq
 
 # === GPIO Setup ===
-for g in gpios:
+for g in gpios_motor:
     os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
     os.system(f"echo out > /sys/class/gpio/gpio{g}/direction")
 
-path = {g: f"/sys/class/gpio/gpio{g}/value" for g in gpios}
+for g in gpios_sensor:
+    os.system(f"echo {g} > /sys/class/gpio/export 2>/dev/null || true")
+os.system(f"echo out > /sys/class/gpio/gpio{TRIG}/direction")
+os.system(f"echo in > /sys/class/gpio/gpio{ECHO}/direction")
 
+# File paths
+path = {g: f"/sys/class/gpio/gpio{g}/value" for g in gpios_motor}
+trig_path = f"/sys/class/gpio/gpio{TRIG}/value"
+echo_path = f"/sys/class/gpio/gpio{ECHO}/value"
+
+# === GPIO Functions ===
 def write(g, v):
-    with open(path[g], "w") as f: f.write("1" if v else "0")
-
-def read(g):
-    with open(path[g], "r") as f: return f.read().strip()
+    with open(path[g], "w") as f:
+        f.write("1" if v else "0")
 
 def set_dir(in1, in2, in3, in4):
-    write(IN1, in1); write(IN2, in2)
-    write(IN3, in3); write(IN4, in4)
+    write(IN1, in1)
+    write(IN2, in2)
+    write(IN3, in3)
+    write(IN4, in4)
+
+def write_pin(gpio_path, value):
+    with open(gpio_path, "w") as f:
+        f.write("1" if value else "0")
+
+def read_pin(gpio_path):
+    with open(gpio_path, "r") as f:
+        return f.read().strip() == "1"
+
+def measure_distance():
+    write_pin(trig_path, 0)
+    time.sleep(0.000002)
+    write_pin(trig_path, 1)
+    time.sleep(0.00001)
+    write_pin(trig_path, 0)
+
+    timeout = time.time() + 0.02
+    while not read_pin(echo_path):
+        if time.time() > timeout:
+            return None
+    start = time.time()
+
+    timeout = time.time() + 0.02
+    while read_pin(echo_path):
+        if time.time() > timeout:
+            return None
+    end = time.time()
+
+    duration = end - start
+    distance_cm = (duration * 34300) / 2
+    return round(distance_cm, 2)
 
 # === Camera Setup ===
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
-# === Tuning Parameters ===
-ROI_FRACTION = 0.6
-CENTER_TOLERANCE = 20
-GENTLE_TURN_MARGIN = 60
-TURN_SPEED = 0.6
-FORWARD_SPEED = 0.7
-GENTLE_DIFF = 0.3
+# === Prepare Save Directory ===
+orig_dir = os.path.expanduser("~/Downloads/original")
+os.makedirs(orig_dir, exist_ok=True)
 
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+fourcc_mp4 = cv2.VideoWriter_fourcc(*'mp4v')
+out_color_path = os.path.join(orig_dir, f"line_follow_black_fast_color_{timestamp}.mp4")
+out_color = cv2.VideoWriter(out_color_path, fourcc_mp4, 24.0, (320, 240))
+
+# === Line Detection Parameters ===
+ROI_FRACTION = 0.6
 kernel = np.ones((3,3), np.uint8)
 
-# === Line Detection with Pure Line-Only Tunnel Vision ===
+# === PID Parameters ===
+KP = 0.005
+BASE_SPEED = 0.7
+MAX_SPEED = 0.95
+PWM_WINDOW = 0.035
+
+# === Obstacle Threshold ===
+OBSTACLE_THRESHOLD = 4.0  # cm
+
 def detect_line_center(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
-
-    # Detect the black line
-    mask = cv2.inRange(blur, 0, 60)
-
-    # Clean mask
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # --- BLACK line detection ---
+    # Black has low brightness (V) and low saturation
+    lower_black = np.array([0, 0, 0])
+    upper_black = np.array([180, 255, 70])
+    mask = cv2.inRange(hsv, lower_black, upper_black)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
 
-    # Tunnel vision: only line is white, everything else black
-    tunnel = np.zeros_like(frame)
-    tunnel[mask > 0] = [255, 255, 255]
-
-    # ROI for line center
-    h, w = mask.shape
-    roi = mask[int(h * ROI_FRACTION):h, :]
-    M = cv2.moments(roi)
-    if M["m00"] > 0:
-        cx = int(M["m10"]/M["m00"])
-        cy = int(M["m01"]/M["m00"]) + int(h * ROI_FRACTION)
-        return cx, cy, tunnel
-
-    return None, None, tunnel
-
-print("Line Follower Active — press ESC to stop")
+# === Main Loop ===
+print("Line Follower (Black Line) + Ultrasonic Stop (≤4cm) — press ESC to stop")
 
 try:
     while True:
+        dist = measure_distance()
+
+        if dist is not None and dist <= OBSTACLE_THRESHOLD:
+            set_dir(0, 0, 0, 0)
+            write(ENA, 0)
+            write(ENB, 0)
+            print(f"Obstacle detected at {dist:.1f} cm — stopping")
+            time.sleep(0.1)
+            continue
+
         ret, frame = cap.read()
         if not ret:
             break
 
-        cx, cy, tunnel = detect_line_center(frame)
-        h, w = frame.shape[:2]
+        mask = detect_line_center(frame)
+        h, w = mask.shape
 
-        if cx is None:
-            action, dirs = "lost", (0,0,0,0)
-            left_duty = right_duty = 0
-        else:
+        roi = mask[int(h * ROI_FRACTION):h, :]
+        M = cv2.moments(roi)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
             error = cx - w / 2
 
-            if abs(error) < CENTER_TOLERANCE:
-                action, dirs = "forward", (1,0,1,0)
-                left_duty = right_duty = FORWARD_SPEED
-            elif error >= CENTER_TOLERANCE and error < GENTLE_TURN_MARGIN:
-                action, dirs = "gentle_right", (1,0,1,0)
-                left_duty, right_duty = FORWARD_SPEED, FORWARD_SPEED - GENTLE_DIFF
-            elif error <= -CENTER_TOLERANCE and error > -GENTLE_TURN_MARGIN:
-                action, dirs = "gentle_left", (1,0,1,0)
-                left_duty, right_duty = FORWARD_SPEED - GENTLE_DIFF, FORWARD_SPEED
-            elif error >= GENTLE_TURN_MARGIN:
-                action, dirs = "turn_right", (1,0,0,1)
-                left_duty = right_duty = TURN_SPEED
-            elif error <= -GENTLE_TURN_MARGIN:
-                action, dirs = "turn_left", (0,1,1,0)
-                left_duty = right_duty = TURN_SPEED
+            if error > 60:
+                left_duty = 0
+                right_duty = MAX_SPEED
+                set_dir(0, 1, 1, 0)
+            elif error < -60:
+                left_duty = MAX_SPEED
+                right_duty = 0
+                set_dir(1, 0, 0, 1)
+            else:
+                left_duty = BASE_SPEED - KP * error
+                right_duty = BASE_SPEED + KP * error
+                left_duty = np.clip(left_duty, 0, MAX_SPEED)
+                right_duty = np.clip(right_duty, 0, MAX_SPEED)
+                set_dir(1, 0, 1, 0)
+        else:
+            left_duty = right_duty = 0
+            set_dir(0, 0, 0, 0)
 
-        set_dir(*dirs)
-
+        # === PWM motor control ===
         t0 = time.time()
-        while time.time() - t0 < 0.05:
-            write(ENA, 1); time.sleep(period * left_duty)
-            write(ENA, 0); time.sleep(period * (1 - left_duty))
-            write(ENB, 1); time.sleep(period * right_duty)
-            write(ENB, 0); time.sleep(period * (1 - right_duty))
+        while time.time() - t0 < PWM_WINDOW:
+            write(ENA, 1)
+            write(ENB, 1)
+            time.sleep(max(period * left_duty, period * right_duty))
+            write(ENA, 0)
+            write(ENB, 0)
+            time.sleep(max(period * (1 - right_duty), period * (1 - left_duty)))
 
-        ins = tuple(read(g) for g in [IN1, IN2, IN3, IN4])
-        print(f"{action:<12} | Center=({cx}) | INs={ins}")
-
-        cv2.imshow("tunnel", tunnel)
+        out_color.write(frame)
+        cv2.imshow("line_follow", frame)
         if cv2.waitKey(1) == 27:
             break
 
-except KeyboardInterrupt:
-    pass
 finally:
     cap.release()
+    out_color.release()
     cv2.destroyAllWindows()
-    set_dir(0,0,0,0)
-    write(ENA,0); write(ENB,0)
-    print("\nAll pins LOW — stopped.")
+    set_dir(0, 0, 0, 0)
+    write(ENA, 0)
+    write(ENB, 0)
+    print(f"\nStopped.\nColor video saved to: {out_color_path}")
