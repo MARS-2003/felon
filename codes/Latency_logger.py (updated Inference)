@@ -1,0 +1,259 @@
+import os
+import cv2
+import numpy as np
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import time
+import csv
+import datetime
+import atexit
+
+# ---------------- USER SETTINGS ----------------
+ENGINE_PATH = os.path.expanduser("~/Downloads/onnx/my_model.engine")
+CLASSES_TXT = os.path.expanduser("~/Downloads/onnx/classes.txt")
+BATCH = 1
+CLASS_CONF_THRES = 0.55
+OBJ_THRES = 0.25
+NMS_IOU = 0.45
+MIN_BOX_AREA = 16
+TOP_K = 60
+PRE_N = 200
+
+# ---------------- CSV LOGGING SETUP (NEW) ----------------
+# We setup the CSV once at the module level to keep the file handle open.
+# This prevents opening/closing the file every frame, which kills performance.
+
+# Define directory (Using the same dir as the engine for now, or current dir)
+SAVE_DIR = os.path.dirname(ENGINE_PATH) 
+if not os.path.exists(SAVE_DIR):
+    SAVE_DIR = os.getcwd()
+
+# Create filename with timestamp
+timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+csv_filename = os.path.join(SAVE_DIR, f"latency_{timestamp}.csv")
+
+# Open file globally
+csv_file = open(csv_filename, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["Frame_Index", "Latency_Sec", "FPS_Instant"])
+
+# Ensure file closes when script/main process ends
+def cleanup_csv():
+    if not csv_file.closed:
+        csv_file.close()
+        print(f"Latency log saved to: {csv_filename}")
+
+atexit.register(cleanup_csv)
+
+# Frame counter
+_frame_idx = 0
+
+# =================================================
+# === Helper Functions ===========================
+# =================================================
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def load_class_names(path):
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            names = [x.strip() for x in f.readlines() if x.strip()]
+        if names:
+            return names
+    return [f"class_{i}" for i in range(256)]
+
+CLASS_NAMES = load_class_names(CLASSES_TXT)
+
+def xywh2xyxy(xywh):
+    xc, yc, w, h = xywh[:,0], xywh[:,1], xywh[:,2], xywh[:,3]
+    x1 = xc - 0.5 * w
+    y1 = yc - 0.5 * h
+    x2 = xc + 0.5 * w
+    y2 = yc + 0.5 * h
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+def nms_numpy(boxes, scores, iou_thres):
+    if boxes.shape[0] == 0:
+        return np.array([], dtype=np.int32)
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
+        inds = np.where(iou <= iou_thres)[0]
+        order = order[inds + 1]
+    return np.array(keep, dtype=np.int32)
+
+# =================================================
+# === TensorRT Engine Setup ======================
+# =================================================
+
+if not os.path.isfile(ENGINE_PATH):
+    raise SystemExit("Engine file not found: " + ENGINE_PATH)
+
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+with open(ENGINE_PATH, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+    engine = runtime.deserialize_cuda_engine(f.read())
+
+context = engine.create_execution_context()
+
+# bindings
+input_idx = None
+output_idx = None
+for i in range(engine.num_bindings):
+    if engine.binding_is_input(i):
+        input_idx = i
+    else:
+        output_idx = i
+
+in_shape = tuple(int(x) for x in engine.get_binding_shape(input_idx))
+out_shape = tuple(int(x) for x in engine.get_binding_shape(output_idx))
+_, C, H_model, W_model = in_shape
+
+stream = cuda.Stream()
+bindings = [None] * engine.num_bindings
+host_buffers = {}
+dev_buffers = {}
+
+for i in range(engine.num_bindings):
+    shape = tuple(int(x) if int(x)>0 else 1 for x in engine.get_binding_shape(i))
+    dtype_np = trt.nptype(engine.get_binding_dtype(i))
+    size = int(np.prod(shape))
+    host_mem = cuda.pagelocked_empty(size, dtype_np)
+    dev_mem = cuda.mem_alloc(host_mem.nbytes)
+    bindings[i] = int(dev_mem)
+    host_buffers[i] = (host_mem, shape)
+    dev_buffers[i] = dev_mem
+
+# =================================================
+# === Frame Inference Function ===================
+# =================================================
+
+# FPS tracking variable
+_last_time = time.time()
+_fps = 0.0
+
+def run_frame(img):
+    """
+    Runs YOLO inference on a single frame.
+    Returns the same frame with boxes and labels drawn.
+    """
+    global _last_time, _fps, _frame_idx
+    
+    # --- LATENCY START ---
+    t_start = time.time()
+    # ---------------------
+
+    H_img, W_img = img.shape[:2]
+    img_resized = cv2.resize(img, (W_model, H_model))
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    arr = img_rgb.astype(np.float32) / 255.0
+    arr = arr.transpose(2,0,1)
+    inp = np.ascontiguousarray(arr.reshape(BATCH, C, H_model, W_model))
+
+    in_host, _ = host_buffers[input_idx]
+    np.copyto(np.frombuffer(in_host, dtype=inp.dtype, count=inp.size), inp.ravel())
+    cuda.memcpy_htod_async(dev_buffers[input_idx], in_host, stream)
+
+    context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+
+    out_host, out_shape_buf = host_buffers[output_idx]
+    cuda.memcpy_dtoh_async(out_host, dev_buffers[output_idx], stream)
+    stream.synchronize()
+
+    flat = np.array(out_host, copy=False)
+    preds = flat.reshape(out_shape_buf).transpose(0,2,1)[0]
+
+    xywh = preds[:,:4]
+    obj_raw = preds[:,4]
+    class_raw = preds[:,5:]
+
+    obj_sig = sigmoid(obj_raw)
+    cls_sig = sigmoid(class_raw)
+    cls_max = cls_sig.max(axis=1)
+    cls_argmax = np.argmax(cls_sig, axis=1)
+    rank_scores = obj_sig * cls_max
+
+    N_total = rank_scores.shape[0]
+    k = min(PRE_N, N_total)
+    if k < N_total:
+        topk_idx = np.argpartition(-rank_scores, k-1)[:k]
+        topk_scores = rank_scores[topk_idx]
+        order = topk_scores.argsort()[::-1]
+        cand_idx = topk_idx[order]
+    else:
+        cand_idx = np.arange(N_total)
+
+    cand_xywh = xywh[cand_idx]
+    cand_boxes = xywh2xyxy(cand_xywh)
+    cand_scores = cls_max[cand_idx]
+    cand_cls = cls_argmax[cand_idx]
+    cand_obj = obj_sig[cand_idx]
+
+    mask = (cand_scores >= CLASS_CONF_THRES) & (cand_obj >= OBJ_THRES)
+    cand_boxes = cand_boxes[mask]
+    cand_scores = cand_scores[mask]
+    cand_cls = cand_cls[mask]
+
+    areas = (cand_boxes[:,2]-cand_boxes[:,0])*(cand_boxes[:,3]-cand_boxes[:,1])
+    keep_area = np.where(areas >= MIN_BOX_AREA)[0]
+    cand_boxes = cand_boxes[keep_area]
+    cand_scores = cand_scores[keep_area]
+    cand_cls = cand_cls[keep_area]
+
+    if cand_boxes.shape[0] > TOP_K:
+        idx_topk = np.argsort(-cand_scores)[:TOP_K]
+        cand_boxes = cand_boxes[idx_topk]
+        cand_scores = cand_scores[idx_topk]
+        cand_cls = cand_cls[idx_topk]
+
+    keep = nms_numpy(cand_boxes, cand_scores, NMS_IOU)
+    cand_boxes = cand_boxes[keep]
+    cand_scores = cand_scores[keep]
+    cand_cls = cand_cls[keep]
+
+    sx = W_img / W_model
+    sy = H_img / H_model
+    boxes_img = cand_boxes.copy()
+    boxes_img[:,[0,2]] *= sx
+    boxes_img[:,[1,3]] *= sy
+
+    for box, score, cid in zip(boxes_img, cand_scores, cand_cls):
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(img, (x1,y1), (x2,y2), (16,200,16), 2)
+        label = f"{CLASS_NAMES[cid] if cid < len(CLASS_NAMES) else cid}:{score:.2f}"
+        cv2.putText(img, label, (x1, max(0,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+    # --- LATENCY CALC & SAVE ---
+    t_end = time.time()
+    latency = t_end - t_start
+    inst_fps = 1.0 / latency if latency > 0 else 0
+    
+    # Write to CSV (Fast operation)
+    csv_writer.writerow([_frame_idx, f"{latency:.6f}", f"{inst_fps:.2f}"])
+    _frame_idx += 1
+    # ---------------------------
+
+    # --- FPS overlay ---
+    now = time.time()
+    dt = now - _last_time
+    if dt > 0:
+        _fps = 0.9 * _fps + 0.1 * (1.0 / dt)  # smoothing
+    _last_time = now
+    cv2.putText(img, f"{_fps:.1f} FPS", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+    return img
