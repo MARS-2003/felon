@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+import subprocess
+import time
+import os
+import signal
+
+# -------------------------------
+# Helper: run ROS commands
+# -------------------------------
+def ros_cmd(cmd):
+    full_cmd = f"bash -lc '{cmd}'"
+    return subprocess.Popen(
+        full_cmd,
+        shell=True,              
+        preexec_fn=os.setsid
+    )
+
+def main():
+    processes = []
+
+    try:
+        print("Starting roscore...")
+        roscore = ros_cmd("roscore")
+        processes.append(roscore)
+        time.sleep(8)
+
+        print("Starting RPLIDAR...")
+        lidar = ros_cmd("roslaunch rplidar_ros rplidar_a2m8.launch")
+        processes.append(lidar)
+        time.sleep(5)
+
+        print("Publishing static TF base_link -> laser...")
+        tf = ros_cmd(
+            "rosrun tf static_transform_publisher 0 0 0 0 0 0 base_link laser 100"
+        )
+        processes.append(tf)
+        time.sleep(2)
+
+        print("Starting Hector Mapping...")
+        hector = ros_cmd(
+            "rosrun hector_mapping hector_mapping scan:=/scan _odom_frame:=base_link"
+        )
+        processes.append(hector)
+        time.sleep(2)
+
+        print("Starting RViz...")
+        rviz = ros_cmd(
+            "rviz -d /home/edgeai/Downloads/rviz_config.rviz"
+        )
+        processes.append(rviz)
+
+        print("\nAll nodes launched successfully.")
+        print("Press Ctrl+C to shut everything down.\n")
+
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nShutting down all ROS processes...")
+        for p in processes:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except:
+                pass
+        print("Shutdown complete.")
+
+if __name__ == "__main__":
+    main()
