@@ -1,4 +1,3 @@
-#this one doesn't save the annotated pictures. Use this one if you need accurate results on resource logging
 import os
 import cv2
 import numpy as np
@@ -7,26 +6,19 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 import time
 import csv
-import atexit
-import shutil
 
-def run(folder_path):
-    # 1. Initialize inside the function for Process safety
+def run(folder_path, results_dir):
     ENGINE_PATH = os.path.expanduser("~/Downloads/onnx/my_model.engine")
-    CLASSES_TXT = os.path.expanduser("~/Downloads/onnx/classes.txt")
     BATCH, CLASS_CONF_THRES, OBJ_THRES = 1, 0.55, 0.25
     NMS_IOU, MIN_BOX_AREA, TOP_K, PRE_N = 0.45, 16, 60, 200
 
-    PARENT_DIR = os.path.dirname(folder_path)
     folder_basename = os.path.basename(folder_path)
-    csv_filename = os.path.join(PARENT_DIR, f"{folder_basename}_stress.csv")
+    csv_filename = os.path.join(results_dir, f"{folder_basename}_stress.csv")
     
-    # Open with buffering=1 (line buffered) to prevent empty files on crash
     csv_file = open(csv_filename, 'w', newline='', buffering=1)
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow(["Frame_Index", "Latency_Sec", "FPS_Instant", "Detection_Count", "Class_IDs"])
 
-    # --- CUDA / TensorRT Setup ---
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     with open(ENGINE_PATH, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         engine = runtime.deserialize_cuda_engine(f.read())
@@ -69,16 +61,14 @@ def run(folder_path):
             order = order[np.where(iou <= iou_thres)[0] + 1]
         return np.array(keep, dtype=np.int32)
 
-    _frame_idx = 0
     image_files = sorted([os.path.join(r, f) for r, _, fs in os.walk(folder_path) for f in fs if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))])
 
     try:
-        for img_path in image_files:
+        for idx, img_path in enumerate(image_files):
             img = cv2.imread(img_path)
             if img is None: continue
             
             t_start = time.time()
-            
             img_resized = cv2.resize(img, (W_model, H_model))
             arr = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             inp = np.ascontiguousarray(arr.transpose(2,0,1).reshape(BATCH, C, H_model, W_model))
@@ -101,8 +91,7 @@ def run(folder_path):
             k = min(PRE_N, rank_scores.shape[0])
             cand_idx = np.argpartition(-rank_scores, k-1)[:k] if k < rank_scores.shape[0] else np.arange(rank_scores.shape[0])
             
-            cand_boxes = xywh2xyxy(xywh[cand_idx])
-            cand_scores, cand_cls, cand_obj = cls_max[cand_idx], cls_argmax[cand_idx], obj_sig[cand_idx]
+            cand_boxes = xywh2xyxy(xywh[cand_idx]); cand_scores = cls_max[cand_idx]; cand_cls = cls_argmax[cand_idx]; cand_obj = obj_sig[cand_idx]
             mask = (cand_scores >= CLASS_CONF_THRES) & (cand_obj >= OBJ_THRES)
             cand_boxes, cand_scores, cand_cls = cand_boxes[mask], cand_scores[mask], cand_cls[mask]
             
@@ -118,8 +107,6 @@ def run(folder_path):
             final_cls = cand_cls[keep]
             
             latency = time.time() - t_start
-            csv_writer.writerow([_frame_idx, f"{latency:.6f}", f"{1.0/latency:.2f}" if latency>0 else 0, len(final_cls), " ".join(str(int(c)) for c in final_cls.tolist())])
-            _frame_idx += 1
+            csv_writer.writerow([idx, f"{latency:.6f}", f"{1.0/latency:.2f}" if latency>0 else 0, len(final_cls), " ".join(str(int(c)) for c in final_cls.tolist())])
     finally:
         csv_file.close()
-        print(f"Stress log saved to: {csv_filename}")
