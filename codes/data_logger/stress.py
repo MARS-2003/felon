@@ -7,23 +7,21 @@ import pycuda.autoinit
 import time
 import csv
 import atexit
-import zipfile
-import tempfile
 import shutil
 
-def run(zip_path):
+def run(folder_path):
     # 1. Initialize inside the function for Process safety
     ENGINE_PATH = os.path.expanduser("~/Downloads/onnx/my_model.engine")
     CLASSES_TXT = os.path.expanduser("~/Downloads/onnx/classes.txt")
     BATCH, CLASS_CONF_THRES, OBJ_THRES = 1, 0.55, 0.25
     NMS_IOU, MIN_BOX_AREA, TOP_K, PRE_N = 0.45, 16, 60, 200
 
-    ZIP_DIR = os.path.dirname(zip_path)
-    zip_basename = os.path.splitext(os.path.basename(zip_path))[0]
-    csv_filename = os.path.join(ZIP_DIR, f"{zip_basename}_stress.csv")
+    PARENT_DIR = os.path.dirname(folder_path)
+    folder_basename = os.path.basename(folder_path)
+    csv_filename = os.path.join(PARENT_DIR, f"{folder_basename}_stress.csv")
     
-    # Create folder for annotated frames in the same directory as the zip
-    output_frames_dir = os.path.join(ZIP_DIR, f"{zip_basename}_annotated_frames")
+    # Create folder for annotated frames in the same directory as the folder
+    output_frames_dir = os.path.join(PARENT_DIR, f"{folder_basename}_annotated_frames")
     os.makedirs(output_frames_dir, exist_ok=True)
 
     # Open with buffering=1 (line buffered) to prevent empty files on crash
@@ -75,11 +73,8 @@ def run(zip_path):
         return np.array(keep, dtype=np.int32)
 
     _frame_idx = 0
-    temp_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(temp_dir)
-    
-    image_files = sorted([os.path.join(r, f) for r, _, fs in os.walk(temp_dir) for f in fs if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))])
+    # Search images directly in the provided folder
+    image_files = sorted([os.path.join(r, f) for r, _, fs in os.walk(folder_path) for f in fs if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))])
 
     try:
         for img_path in image_files:
@@ -152,6 +147,5 @@ def run(zip_path):
             _frame_idx += 1
     finally:
         csv_file.close()
-        shutil.rmtree(temp_dir)
         print(f"Stress log saved to: {csv_filename}")
         print(f"Annotated frames saved in: {output_frames_dir}")
