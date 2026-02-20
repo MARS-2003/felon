@@ -12,25 +12,31 @@ if __name__ == '__main__':
     if not os.path.isdir(parent_dir):
         print("Error: Directory not found.")
     else:
-        # Get all subdirectories
-        folders = [os.path.join(parent_dir, d) for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
+        # Create a single central results directory
+        results_dir = os.path.join(parent_dir, "benchmark_results")
+        os.makedirs(results_dir, exist_ok=True)
+
+        # Get all subdirectories, excluding the results folder itself
+        folders = [os.path.join(parent_dir, d) for d in os.listdir(parent_dir) 
+                   if os.path.isdir(os.path.join(parent_dir, d)) and d != "benchmark_results"]
         folders.sort()
 
-        print(f"--- Found {len(folders)} folders to process ---")
+        total_folders = len(folders)
+        print(f"--- Found {total_folders} folders to process ---")
+        print(f"--- Results will be saved to: {results_dir} ---")
 
-        for folder_path in folders:
+        for index, folder_path in enumerate(folders, 1):
             folder_name = os.path.basename(folder_path)
-            print(f"\n>>> Processing: {folder_name}")
+            print(f"\n[{index}/{total_folders}] >>> Processing: {folder_name}")
 
-            # Create processes for the current folder
-            p_stress = multiprocessing.Process(target=stress.run, args=(folder_path,))
-            p_logger = multiprocessing.Process(target=logger.run, args=(folder_path,))
+            # Create processes
+            p_stress = multiprocessing.Process(target=stress.run, args=(folder_path, results_dir))
+            p_logger = multiprocessing.Process(target=logger.run, args=(folder_path, results_dir))
 
-            print(f"--- Starting Concurrent Run for {folder_name} ---")
             p_logger.start()
             p_stress.start()
 
-            # Wait for stress to finish
+            # Wait for inference to finish
             p_stress.join()
 
             # Shutdown logger
@@ -38,6 +44,4 @@ if __name__ == '__main__':
                 p_logger.terminate()
                 p_logger.join()
 
-            print(f"--- Finished processing {folder_name} ---")
-
-        print("\n--- All folders complete ---")
+        print("\n--- All processes complete. Check the 'benchmark_results' folder. ---")
