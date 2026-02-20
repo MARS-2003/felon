@@ -6,11 +6,11 @@ from datetime import datetime
 from jtop import jtop
 import math
 
-def run(zip_path):
-    # === Match directory of the ZIP file ===
-    save_dir = os.path.dirname(zip_path)
-    zip_basename = os.path.splitext(os.path.basename(zip_path))[0]
-    csv_path = os.path.join(save_dir, f"{zip_basename}_logger.csv")
+def run(folder_path):
+    # === Match directory of the Folder ===
+    save_dir = os.path.dirname(folder_path)
+    folder_basename = os.path.basename(folder_path)
+    csv_path = os.path.join(save_dir, f"{folder_basename}_logger.csv")
 
     print(f"Starting logger. Saving to: {csv_path}")
 
@@ -38,7 +38,6 @@ def run(zip_path):
 
                     # --- GPU Extraction (Robust check) ---
                     gpu_data = jetson.gpu.get('gpu', {})
-                    # Some jtop versions use 'load', others use 'val'
                     gpu_usage = gpu_data.get('status', {}).get('load', 0.0) 
                     if gpu_usage == 0.0:
                         gpu_usage = gpu_data.get('load', 0.0)
